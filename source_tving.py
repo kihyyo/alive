@@ -51,7 +51,7 @@ class SourceTving(SourceBase):
     def load_support_module(self):
         from support_site import SupportTving as ST  # type: ignore
 
-        token = ST._SupportTving__token.strip()  # pylint: disable=protected-access
+        token = ST._SupportTving__token  # pylint: disable=protected-access
         if not token:
             logger.error("티빙 토큰이 필요합니다.")
             return None
