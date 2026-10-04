@@ -86,6 +86,11 @@ class LogicKlive:
             cls.__load_sources()
         if cls.should_reload_channels(reload in ["soft", "hard"]):
             cls.__load_channels()
+            # A callback causes Shyni to read M3U again. Only explicit refreshes
+            # notify; a lazy refresh while serving that M3U must not loop.
+            if reload in ("soft", "hard"):
+                from .refresh_notify import notify_after_refresh
+                notify_after_refresh()
 
     @classmethod
     def all_channels(cls, reload: Literal["soft", "hard"] = None) -> list[ChannelItem]:
