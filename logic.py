@@ -31,6 +31,9 @@ package_name = P.package_name
 ModelSetting = P.ModelSetting
 blueprint = P.blueprint
 
+from .bot_epg import install_bot_epg_hook
+install_bot_epg_hook(F.app)
+
 
 @stream_with_context
 def generate(url):
@@ -84,6 +87,7 @@ class Logic(PluginModuleBase):
     db_default = {
         "channel_list_updated_at": "1970-01-01T00:00:00",
         "channel_list_max_age": "60",  # minutes
+        "source_refresh_notify_url": "",
         "epg_updated_at": "1970-01-01T00:00:00",
         "web_player_target": "blank",
         # wavve
@@ -232,6 +236,9 @@ class Logic(PluginModuleBase):
             return Response(status=204)
         if stype == "redirect":
             r = redirect(sdata, code=302)
+        elif stype == "drm":
+            r = jsonify(sdata)
+            r.headers["Cache-Control"] = "no-store"
         elif stype == "stream":
             r = Response(_streamlink(sdata), mimetype="video/MP2T", direct_passthrough=True)
         else:
@@ -245,6 +252,9 @@ class Logic(PluginModuleBase):
                 else:
                     sdata = src.rewrite_hls_master_urls(sdata, request.full_path)
             r = Response(sdata, content_type="application/vnd.apple.mpegurl")
+            # These URLs are stable while live segments and ad periods change.
+            # Browser/intermediate caches must not pin an older playlist.
+            r.headers["Cache-Control"] = "no-store"
         logger.debug("%s", " -> ".join([f"{source_id} {channel_id}", f"({stype})", request.remote_addr]))
         return r
 
@@ -267,7 +277,9 @@ class Logic(PluginModuleBase):
                 if isinstance(sdata, str):
                     sdata = json.loads(sdata)
                 logger.debug("%s", " -> ".join([f"{source} {channel_id}", f"({stype})", req.remote_addr]))
-                return jsonify(sdata)
+                response = jsonify(sdata)
+                response.headers["Cache-Control"] = "no-store"
+                return response
             logger.error("잘못된 sub: %s", sub)
             abort(400)
         except HTTPException as e:
@@ -365,11 +377,33 @@ def proxy_chunk():
     except Exception:
         abort(404)
     try:
-        r = src.plsess.get(url, stream=True, timeout=30)
+        headers = {}
+        if request.headers.get("Range"):
+            headers["Range"] = request.headers["Range"]
+        r = src.plsess.get(url, headers=headers, stream=True, timeout=(3.05, 15))
+
+        def chunks():
+            try:
+                # A 1 MiB read delays smaller live fragments until enough bytes
+                # accumulate. Forward available network-sized blocks instead.
+                yield from r.iter_content(chunk_size=65536)
+            finally:
+                r.close()
+
+        response_headers = {
+            name: r.headers[name]
+            for name in ("Content-Range", "Accept-Ranges")
+            if name in r.headers
+        }
+        # Preserve byte-range semantics for EXT-X-MAP/BYTERANGE resources.
+        # requests may decompress content, so do not blindly forward its length.
+        if "Content-Length" in r.headers and not r.headers.get("Content-Encoding"):
+            response_headers["Content-Length"] = r.headers["Content-Length"]
         return Response(
-            r.iter_content(chunk_size=1048576),
+            chunks(),
             status=r.status_code,
-            content_type=r.headers["Content-Type"],
+            headers=response_headers,
+            content_type=r.headers.get("Content-Type", "application/octet-stream"),
             direct_passthrough=True,
         )
     except Exception:
