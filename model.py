@@ -153,9 +153,15 @@ class ChannelItem:
         display_name = kwargs.setdefault("display_name", self.name)
         url = kwargs.setdefault("url", self.svc_url())
         data = (tvg_id, tvg_name, tvg_logo, group_title, tvg_chno, tvh_chnum, display_name, url)
-        if self.is_tv:
-            return M3U_FORMAT % data
-        return M3U_RADIO_FORMAT % data
+        result = (M3U_FORMAT if self.is_tv else M3U_RADIO_FORMAT) % data
+        fallback = getattr(self, "epg_fallback", None)
+        if self.source == "bot" and fallback:
+            # Optional attributes are ignored by ordinary M3U consumers. No
+            # stream credentials or DRM keys are included in EPG metadata.
+            start, stop = fallback
+            result = result.replace("#EXTINF:-1 ",
+                f'#EXTINF:-1 shyni-epg-start="{start}" shyni-epg-stop="{stop}" ', 1)
+        return result
 
 
 class ChannelMap(OrderedDict):
