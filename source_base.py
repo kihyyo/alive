@@ -179,11 +179,13 @@ class CachedMethod:
         self.func = func
         self.cache = lru_cache(maxsize=10)(self._call)
 
-    def _call(self, obj, *args, **kwargs):
+    def _call(self, obj, _bucket, *args, **kwargs):
         return self.func(obj, *args, **kwargs)
 
     def __get__(self, obj, objtype=None):
-        return lambda *args, **kwargs: self.cache(obj, *args, **kwargs)
+        # A live master URL may stay the same while its rendition topology changes.
+        # Do not retain the first manifest for the full signed-URL lifetime.
+        return lambda *args, **kwargs: self.cache(obj, int(time.monotonic() // 15), *args, **kwargs)
 
 
 class SourceBase:
@@ -224,8 +226,17 @@ class SourceBase:
     @CachedMethod
     def get_m3u8(self, url: str) -> dict:
         logger.debug("opening url: %s", url)
-        data = self.plsess.get(url).text
-        return parse_hls_master_playlist(data, url)
+        data, resolved_url = self.fetch_hls_playlist(url)
+        return parse_hls_master_playlist(data, resolved_url)
+
+    def fetch_hls_playlist(self, url: str) -> tuple[str, str]:
+        with self.plsess.get(url, timeout=(3.05, 5)) as response:
+            response.raise_for_status()
+            data = response.text.lstrip("\ufeff")
+            if not data.lstrip().startswith("#EXTM3U"):
+                raise ValueError("Upstream returned a non-HLS playlist")
+            # Relative URIs are resolved against the final location after redirects.
+            return data, response.url or url
 
     def repack_m3u8(self, url: str, streaming_type: str) -> str:
         """repack m3u8 media playlist"""
@@ -233,21 +244,23 @@ class SourceBase:
             self._repack_cache = {}
             self._repack_lock = Lock()
 
-        now = time.time()
+        now = time.monotonic()
+        data = None
         with self._repack_lock:
             if url in self._repack_cache:
-                data, ts, ttl = self._repack_cache[url]
+                cached, ts, ttl = self._repack_cache[url]
                 if now - ts < ttl:
-                    return data
+                    data = cached
 
-        raw = self.plsess.get(url, timeout=5).text
-        data, ttl = self.parse_hls_media_playlist(raw, url)
+        if data is None:
+            raw, resolved_url = self.fetch_hls_playlist(url)
+            data, ttl = self.parse_hls_media_playlist(raw, resolved_url)
 
-        now = time.time()
-        with self._repack_lock:
-            self._repack_cache[url] = (data, now, ttl)
-            for expired in [k for k, (_, ts, _) in self._repack_cache.items() if now - ts > 10.0]:
-                del self._repack_cache[expired]
+            now = time.monotonic()
+            with self._repack_lock:
+                self._repack_cache[url] = (data, now, ttl)
+                for expired in [k for k, (_, ts, _) in self._repack_cache.items() if now - ts > 10.0]:
+                    del self._repack_cache[expired]
 
         if streaming_type == "direct":
             return data
@@ -308,7 +321,9 @@ class SourceBase:
                     pass
             elif line.startswith(("#EXT-X-MAP:", "#EXT-X-KEY:")):
                 raw = _rewrite_hls_uri_attr(raw, lambda uri: _complete_hls_media_url(media_url, uri))
-            elif line and not line.startswith("#") and _is_hls_media_uri(line):
+            # MediaTailor SSAI segments use extensionless /segment/... URLs.
+            # Every non-comment media-playlist line is a URI, including these.
+            elif line and not line.startswith("#"):
                 raw = _complete_hls_media_url(media_url, line)
             output.append(raw)
         if part_target:
@@ -329,7 +344,8 @@ class SourceBase:
             line = raw.strip()
             if line.startswith(("#EXT-X-MAP:", "#EXT-X-KEY:")):
                 raw = _rewrite_hls_uri_attr(raw, proxy_url)
-            elif line.startswith(("http://", "https://")) and _is_hls_media_uri(line):
+            elif line.startswith(("http://", "https://")):
                 raw = proxy_url(line)
             output.append(raw)
         return "\n".join(output) + "\n"
+
