@@ -12,6 +12,7 @@ from tool import ToolUtil  # type: ignore # pylint: disable=import-error
 from .model import ChannelItem, ProgramItem
 from .setup import P
 from .source_base import SourceBase
+from .bot_epg import _time
 
 logger = P.logger
 package_name = P.package_name
@@ -29,6 +30,13 @@ class SourceBot(SourceBase):
         for item in items:
             c = ChannelItem(self.source_id, item["code"], item["title"], item["poster"], True, item["is_drm"])
             c.program = ProgramItem(title=f"{item['start_time_str']} ~ {item['end_time_str']}")
+            start = _time(item.get("start_time")) or _time(item.get("start_time_str"))
+            stop = _time(item.get("end_time")) or _time(item.get("end_time_str"))
+            if start and stop and stop > start:
+                # Preserve the event's actual date (including overnight events),
+                # rather than ProgramItem's provider-specific today adjustment.
+                c.epg_fallback = (start.strftime("%Y%m%d%H%M%S %z"),
+                                  stop.strftime("%Y%m%d%H%M%S %z"))
             ret.append(c)
         self.channels = OrderedDict((c.channel_id, c) for c in ret)
 
@@ -64,12 +72,29 @@ class SourceBot(SourceBase):
             if db_item.ott == "CPP":
                 if not db_item.is_drm:
                     return "redirect", db_item.stream_url
+                info = db_item.info or {}
+                key = info.get("key", "")
+                # An encrypted envelope is opaque to ALive; only Shyni holds
+                # the wrapping key and verifies the GCM authentication tag.
+                if not isinstance(key, str) or not (
+                    re.fullmatch(
+                        r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}):[0-9a-fA-F]{32}", key.strip()
+                    ) or re.fullmatch(r"shyni-key:v1:[A-Za-z0-9_-]{124}", key.strip())
+                ):
+                    raise ValueError("CPP DRM key must be KID:KEY or a supported encrypted envelope")
+                return "drm", {
+                    "src": db_item.stream_url,
+                    "type": "application/dash+xml",
+                    "key": key.strip(),
+                }
         return None, ""
 
     def process_discord_data(self, msg):
         refresh = ModelBot.process(msg["msg"]["data"])
         if refresh:
             self.load_channels()
+            from .refresh_notify import notify_after_refresh
+            notify_after_refresh()
 
 
 @F.app.route("/alive/bot/proxy")
@@ -144,6 +169,24 @@ class ModelBot(ModelBase):
                     db_item.save()
                     logger.debug("새로운 방송: %s", data["t"])
                     return True
+                # A start event can rotate the signed URL/key of an existing event.
+                # Keep the latest info instead of silently retaining expired data.
+                changed = (db_item.info != data["i"] or db_item.title != data["t"]
+                           or db_item.poster != data["p"] or db_item.start_time_str != data["t1"]
+                           or db_item.end_time_str != data["t2"])
+                if changed:
+                    db_item.title = data["t"]
+                    db_item.poster = data["p"]
+                    db_item.start_time_str = data["t1"]
+                    db_item.end_time_str = data["t2"]
+                    db_item.start_time = datetime.strptime(data["t1"], "%Y-%m-%d %H:%M")
+                    db_item.end_time = datetime.strptime(data["t2"], "%Y-%m-%d %H:%M")
+                    db_item.is_drm = data["i"]["is_drm"]
+                    db_item.info = data["i"]
+                    db_item.stream_url = data["i"]["src"]
+                    db_item.save()
+                    logger.debug("방송 정보 갱신: %s", data["t"])
+                    return True
                 logger.debug("이미 등록된 방송: %s", data["t"])
             elif data["s"] == "end":
                 if db_item is not None:
@@ -152,8 +195,8 @@ class ModelBot(ModelBase):
                     return True
 
         except Exception as e:
-            logger.error(f"Exception:{str(e)}")
-            logger.error(traceback.format_exc())
+            # SQLAlchemy errors may contain bound JSON, including DRM keys.
+            logger.error("BOT 데이터 처리 실패 (%s)", type(e).__name__)
         return False
 
     @classmethod
