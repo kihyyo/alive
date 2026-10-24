@@ -2,6 +2,8 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Literal
+from threading import Lock, Thread
+from time import monotonic
 
 from plugin import F  # type: ignore # pylint: disable=import-error
 
@@ -26,6 +28,8 @@ SystemModelSetting = F.SystemModelSetting
 
 class LogicKlive:
     sources: OrderedDict[str, SourceBase] = OrderedDict()
+    _channel_refresh_lock = Lock()
+    _channel_retry_at = 0.0
 
     @classmethod
     def __load_sources(cls) -> None:
@@ -82,15 +86,40 @@ class LogicKlive:
 
     @classmethod
     def load_channels(cls, reload: Literal["soft", "hard"] = None) -> None:
-        if not cls.sources or reload == "hard":
-            cls.__load_sources()
-        if cls.should_reload_channels(reload in ["soft", "hard"]):
-            cls.__load_channels()
-            # A callback causes Shyni to read M3U again. Only explicit refreshes
-            # notify; a lazy refresh while serving that M3U must not loop.
-            if reload in ("soft", "hard"):
-                from .refresh_notify import notify_after_refresh
-                notify_after_refresh()
+        changed = False
+        with cls._channel_refresh_lock:
+            if not cls.sources or reload == "hard":
+                cls.__load_sources()
+            if cls.should_reload_channels(reload in ["soft", "hard"]):
+                cls.__load_channels()
+                changed = True
+        # Notify outside the lock: the receiver may immediately fetch M3U.
+        if changed and reload in ("soft", "hard"):
+            from .refresh_notify import notify_after_refresh
+            notify_after_refresh()
+
+    @classmethod
+    def _refresh_playback_channels(cls):
+        if monotonic() < cls._channel_retry_at:
+            return
+        if not cls._channel_refresh_lock.acquire(blocking=False):
+            return
+
+        def refresh():
+            try:
+                if cls.should_reload_channels(False):
+                    cls.__load_channels()
+            except Exception as exc:
+                logger.warning("Channel refresh failed error=%s", type(exc).__name__)
+            finally:
+                cls._channel_retry_at = monotonic() + 3
+                cls._channel_refresh_lock.release()
+
+        try:
+            Thread(target=refresh, name="alive-channel-refresh", daemon=True).start()
+        except Exception:
+            cls._channel_refresh_lock.release()
+            raise
 
     @classmethod
     def all_channels(cls, reload: Literal["soft", "hard"] = None) -> list[ChannelItem]:
@@ -103,6 +132,14 @@ class LogicKlive:
 
     @classmethod
     def get_source(cls, source: str) -> SourceBase | None:
+        current = cls.sources.get(source)
+        if current is not None and current.channels:
+            # A metadata refresh must not stop the short live media window.
+            # Keep the current source object (and its URL cache) while loading
+            # channel/program metadata in the background.
+            if cls.should_reload_channels(False):
+                cls._refresh_playback_channels()
+            return current
         cls.load_channels()
         return cls.sources.get(source)
 
