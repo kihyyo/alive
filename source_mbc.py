@@ -5,6 +5,7 @@ from datetime import datetime
 from .model import ChannelItem, ProgramItem
 from .setup import P
 from .source_base import SourceBase, URLCacher
+from .live_source_cache import LiveSourceCache
 
 logger = P.logger
 package_name = P.package_name
@@ -36,13 +37,19 @@ class SourceMBC(SourceBase):
         self.plsess = SourceBase.new_session(proxy_url=plproxy, add_headers={"Referer": "https://onair.imbc.com/"})
         # caching master playlist url
         self.get_url = URLCacher(self.ttl)(self.__get_url)
+        self._live_cache = LiveSourceCache(self, self.__get_url)
+
+    def _api_get(self, url, *, json=False):
+        with self.apisess.get(url, timeout=(3.05, 5)) as response:
+            response.raise_for_status()
+            return response.json() if json else response.text
 
     def load_channels(self) -> None:
         ret = []
         now = datetime.now()
         t = f"{now.day}{now.hour}{now.minute}"
         url = f"https://control.imbc.com/Schedule/ONAIRWITHNVOD?t={t}"
-        data = self.apisess.get(url).json()
+        data = self._api_get(url, json=True)
         for item in data:
             try:
                 p = ProgramItem(
@@ -75,7 +82,7 @@ class SourceMBC(SourceBase):
 
         now = int(time.time() * 1000)
         url = f"https://mediaapi.imbc.com/Player/{path}&type=PC&t={now}"
-        data = self.apisess.get(url).json()
+        data = self._api_get(url, json=True)
         if channel_id == "17":
             return data
         return data["MediaInfo"]
@@ -83,12 +90,11 @@ class SourceMBC(SourceBase):
     def __get_url(self, channel_id: str) -> str:
         if not self.channels[channel_id].is_tv:  # radio
             url = f"https://sminiplay.imbc.com/aacplay.ashx?channel={channel_id}&protocol=M3U8&agent=webapp"
-            return self.apisess.get(url).text
+            return self._api_get(url)
         return self.get_data(channel_id)["MediaURL"]
 
     def make_m3u8(self, channel_id: str, mode: str, quality: str) -> tuple[str, str | dict]:
-        url = self.get_url(channel_id)
         if not self.channels[channel_id].is_tv:
-            return "redirect", url
+            return "redirect", self._live_cache.get(channel_id, master=False)["_source_url"]
         stype = "proxy"  # chunk를 받아올 때도 referer가 필요하기 때문에 proxy만 가능
-        return stype, self.get_m3u8(url)
+        return stype, self._live_cache.get(channel_id, master=True)
