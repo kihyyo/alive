@@ -4,6 +4,7 @@ from collections import OrderedDict
 from .model import ChannelItem, ProgramItem
 from .setup import P
 from .source_base import SourceBase, URLCacher
+from .live_source_cache import LiveSourceCache
 
 logger = P.logger
 package_name = P.package_name
@@ -23,17 +24,23 @@ class SourceKBS(SourceBase):
         self.plsess = self.new_session(proxy_url=plproxy, add_headers={"Referer": "https://onair.kbs.co.kr"})
         # cached playlist url
         self.get_url = URLCacher(self.ttl)(self.__get_url)
+        self._live_cache = LiveSourceCache(self, self.__get_url)
 
     def __parse_var(self, text: str, identifiers: tuple[str, str]) -> dict:
         left = text.find(identifiers[0]) + len(identifiers[0])
         right = text.find(identifiers[1], left)
         return json.loads(text[left:right].replace("\\", ""))
 
+    def _api_get(self, url, *, json=False):
+        with self.apisess.get(url, timeout=(3.05, 5)) as response:
+            response.raise_for_status()
+            return response.json() if json else response.text
+
     def load_channels(self) -> None:
         ret = []
         include_vod_ch = ModelSetting.get_bool("kbs_include_vod_ch")
         url = "https://onair.kbs.co.kr"
-        data = self.apisess.get(url).text
+        data = self._api_get(url)
         data = self.__parse_var(data, ("adminChannelList = JSON.parse('", "');"))
         for channel in data["channel"]:
             for cm in channel["channel_master"]:
@@ -60,16 +67,17 @@ class SourceKBS(SourceBase):
 
     def get_data(self, channel_id: str) -> dict:
         tmp = f"https://cfpwwwapi.kbs.co.kr/api/v1/landing/live/channel_code/{channel_id}"
-        return self.apisess.get(tmp).json()
+        return self._api_get(tmp, json=True)
 
     def __get_url(self, channel_id: str) -> str:
         return self.get_data(channel_id)["channel_item"][0]["service_url"]
 
     def make_m3u8(self, channel_id: str, mode: str, quality: str) -> tuple[str, str]:
         stype = self.streaming_type
-        url = self.get_url(channel_id)
+        master = stype != "redirect" and channel_id == "cctv01"
+        value = self._live_cache.get(channel_id, master=master)
         if stype == "redirect":
-            return stype, url
-        if channel_id in ["cctv01"]:  # 독도 채널은 multivariant
-            return stype, self.get_m3u8(url)
-        return stype, self.repack_m3u8(url, stype)  # direct, proxy
+            return stype, value["_source_url"]
+        if master:  # 독도 채널은 multivariant
+            return stype, value
+        return stype, self.repack_m3u8(value["_source_url"], stype)  # direct, proxy
