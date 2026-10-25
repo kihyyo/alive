@@ -154,6 +154,11 @@ class ChannelItem:
         url = kwargs.setdefault("url", self.svc_url())
         data = (tvg_id, tvg_name, tvg_logo, group_title, tvg_chno, tvh_chnum, display_name, url)
         result = (M3U_FORMAT if self.is_tv else M3U_RADIO_FORMAT) % data
+        # Stable, public event identity only. Preserve tvg-id and playback URL.
+        if self.source == "bot" and str(self.channel_id).startswith("CPP_"):
+            event_id = str(self.channel_id)
+            if event_id.isascii() and all(c.isalnum() or c in "_-" for c in event_id) and len(event_id) <= 164:
+                result = result.replace("#EXTINF:-1 ", f'#EXTINF:-1 shyni-event-id="{event_id}" ', 1)
         fallback = getattr(self, "epg_fallback", None)
         if self.source == "bot" and fallback:
             # Optional attributes are ignored by ordinary M3U consumers. No
